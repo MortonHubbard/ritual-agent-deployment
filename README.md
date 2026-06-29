@@ -2,9 +2,9 @@
 
 # Ritual Sovereign Agent
 
-**Deploy a recurring, self-funding AI agent on Ritual testnet with one command. No API keys.**
+**Deploy a recurring, sovereign AI agent on Ritual testnet with one command. No API keys.**
 
-<a href="https://x.com/Zun2025"><img src="assets/banner.svg" width="100%" alt="Ritual Sovereign Agent - recurring keyless AI agent on Ritual testnet" /></a>
+<a href="https://x.com/Zun2025"><img src="assets/banner.svg" width="100%" alt="Ritual Sovereign Agent - Deployment Guide by Zun" /></a>
 
 </div>
 
@@ -51,11 +51,19 @@ There is nothing you must edit - the defaults work. `PROMPT` is the task your ag
 
 ### Step 3 - Deploy
 
-On Windows (PowerShell):
+On Windows, using PowerShell 7 (`pwsh`):
 
 ```powershell
-pwsh run.ps1
+pwsh -ExecutionPolicy Bypass -File run.ps1
 ```
+
+On Windows, using Windows PowerShell 5.1 (`powershell`, which is preinstalled on every Windows):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File run.ps1
+```
+
+`-ExecutionPolicy Bypass` lets the script run without changing any system setting (Windows blocks unsigned scripts by default); it applies only to this one launch.
 
 On Linux / macOS / Git Bash / WSL:
 
@@ -67,18 +75,28 @@ bash run.sh
 
 <h2 align="center">🛠 Managing your agents 🛠</h2>
 
-Each agent is its own contract at a deterministic address (your wallet + a salt). Run a command with **no address** to act on the agent named by `SALT` in `.env`, or pass an **agent address** to target a specific one.
+Each agent is its own contract at a fixed address (your wallet plus a salt). On Windows, use `pwsh -ExecutionPolicy Bypass -File run.ps1` in place of `bash run.sh` in the examples below.
 
-| Command | What it does |
-| --- | --- |
-| `bash run.sh` | Deploy + fund + arm. If one is already live, it asks before making another. |
-| `bash run.sh status` | List every agent you have deployed, with state and balance. |
-| `bash run.sh status <address>` | Full detail for one agent. |
-| `bash run.sh topup <address> [wei]` | Add more RITUAL (re-arms it if it was stopped). |
-| `bash run.sh restart <address>` | Re-arm a stopped agent. |
-| `bash run.sh stop <address>` | Stop an agent's schedule. |
+```bash
+bash run.sh                          # deploy your first agent using .env 
+bash run.sh view                     # list all your agents
+bash run.sh view 0xSomeWallet...     # list the agents of any wallet
+bash run.sh topup 0xAgent... 2       # deposit 2 RITUAL into agent wallet
+bash run.sh topup 0xAgent...         # deposit the .env DEPOSIT amount
+```
+---
 
-**Want a second agent?** Just run `bash run.sh` again. It notices your first one is live, asks `Deploy another? [y/N]`, and on yes creates the next (`agent-1` -> `agent-2`, ...).
+<h2 align="center">🩺 Status & health checks 🩺</h2>
+
+Before funding anything, check the agent's status on the explorer: **https://ritual-testnet-explorer.vercel.app/**
+
+Read the status, then act on it:
+
+- **Agent is dead** -> do **not** deposit. The deposit transaction still succeeds on-chain, but the RITUAL is stranded: the agent has no scheduled wake left (the Scheduler reverts with `CallNotFound()`), so the funds are never spent and cannot be recovered. A dead agent cannot be revived by funding it - deploy a fresh agent instead.
+
+- **Agent is live but low on RITUAL** -> top it up **immediately** with `topup`. A live agent keeps itself going by scheduling its next wake on every wake, but only while it has the balance to pay for it. If it drains and misses a wake, the call chain breaks and funding can no longer restart it.
+
+**Known limitation:** the `restart`, `start`, `withdraw`, and `stop` functions are not callable - an implementation bug in Ritual's proxy contract makes them revert. The Ritual team must upgrade the proxy contract before these work. Until then there is no way to restart a dead agent or withdraw stranded RITUAL.
 
 ---
 
@@ -90,7 +108,7 @@ Each agent is its own contract at a deterministic address (your wallet + a salt)
 | --- | --- |
 | `RPC_URL` | Ritual testnet RPC endpoint. |
 | `CHAIN_ID` | `1979` (Ritual testnet). |
-| `DEPOSIT_WEI` | RITUAL locked into the agent's wallet, in wei. `0.015 RITUAL` is roughly one wake. |
+| `DEPOSIT` | RITUAL to lock into the agent's wallet on deploy. Use a plain number, where `1` means 1 RITUAL and decimals like `0.5` are fine. One wake costs about 0.5 to 1 RITUAL. `1` is the minimum a deploy accepts, and `5` gives about 5 wakes of headroom. |
 | `CLI_TYPE` | Harness type. `6` = ZeroClaw. |
 | `MODEL` | Model id routed through Ritual's gateway (no external key). Default `zai-org/GLM-4.7-FP8`. |
 | `PROMPT` | The task the agent runs on each wake. |
@@ -105,9 +123,9 @@ Your private key is never written to `.env`; it lives encrypted in `~/.foundry/k
 
 <h2 align="center">🌐 Network 🌐</h2>
 
-| Network | Chain ID | RPC | Faucet | SovereignAgentFactory |
-| --- | --- | --- | --- | --- |
-| **Ritual testnet** | `1979` | `https://rpc.ritualfoundation.org` | https://faucet.ritualfoundation.org | `0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304` |
+| Network | Chain ID | RPC | Faucet |
+| --- | --- | --- | --- |
+| **Ritual testnet** | `1979` | `https://rpc.ritualfoundation.org` | https://faucet.ritualfoundation.org |
 
 ---
 

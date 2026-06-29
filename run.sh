@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh - manage a recurring sovereign agent on Ritual testnet (chain 1979).
-# Commands: deploy (default), status, topup, restart, stop. Keyless Ritual LLM, signs from an
+# Commands: deploy (default), view, topup. Keyless Ritual LLM, signs from an
 # encrypted keystore (set up on first run), and auto-installs foundry + uv if missing.
 
 set -euo pipefail
@@ -49,9 +49,24 @@ ok()   { printf '  %sok%s %s\n' "$OKC" "$RESET" "$1"; }
 warn() { printf '  %s!%s  %s\n' "$WARNC" "$RESET" "$1"; }
 kv()   { printf '  %s%-11s%s %s\n' "$MUTED" "$1" "$RESET" "$2"; }
 
-# Run a command behind a braille spinner; output is captured and shown only on failure. An
-# optional leading integer retries the command that many times (for flaky network steps).
-SPIN_FRAMES=($'⠋' $'⠙' $'⠹' $'⠸' $'⠼' $'⠴' $'⠦' $'⠧' $'⠇' $'⠏')
+# Braille spinner glyphs only render on a UTF-8 terminal; on a legacy/C-locale terminal they turn
+# into mojibake or blanks. Detect UTF-8 from the locale (with a `locale charmap` cross-check) and
+# fall back to a plain ASCII spinner everywhere else.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) UTF8=1 ;;
+  *) UTF8=0 ;;
+esac
+if [ "$UTF8" = 0 ] && command -v locale >/dev/null 2>&1; then
+  case "$(locale charmap 2>/dev/null)" in [Uu][Tt][Ff]-8 | [Uu][Tt][Ff]8) UTF8=1 ;; esac
+fi
+
+# Run a command behind a spinner; output is captured and shown only on failure. An optional leading
+# integer retries the command that many times (for flaky network steps).
+if [ "$UTF8" = 1 ]; then
+  SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+else
+  SPIN_FRAMES=('|' '/' '-' '\')
+fi
 spin() {
   local tries=1
   case "$1" in '' | *[!0-9]*) ;; *) tries="$1"; shift ;; esac
@@ -84,14 +99,16 @@ usage() {
   cat <<EOF
   ${BOLD}Usage${RESET}  bash run.sh [command] [args]
 
-  ${ACCENT}deploy${RESET}                    deploy + fund + arm (asks before making a 2nd agent)
-  ${ACCENT}status${RESET} [address]          list your agents, or detail one by address
-  ${ACCENT}topup${RESET} [address] [wei]     deposit more RITUAL (re-arms if stopped)
-  ${ACCENT}restart${RESET} [address]         re-arm an agent
-  ${ACCENT}stop${RESET} [address]            stop an agent
+  ${ACCENT}deploy${RESET}                    deploy + fund + arm (shows your agents, then asks before adding another)
+  ${ACCENT}view${RESET} [eoa]                list every agent an EOA deployed: live/dead + stuck RITUAL
+  ${ACCENT}topup${RESET} [address] [amount]  deposit more RITUAL into an agent's wallet
   ${ACCENT}help${RESET}                      show this help
 
-  No address -> the agent for SALT in .env. Lock duration: LOCK_BLOCKS (default 100000).
+  view defaults to your own wallet. topup with no address -> the agent for SALT in .env.
+  Amounts are in RITUAL. Lock duration: LOCK_BLOCKS (default 100000).
+
+  Note: stop/restart/withdraw are not exposed - a bug in Ritual's proxy contract makes
+  them revert today. They should work once the Ritual team upgrades the proxy.
 EOF
 }
 
@@ -115,11 +132,31 @@ done < "$HERE/.env"
 # Ritual testnet system contracts
 FACTORY="0x9dC4C054e53bCc4Ce0A0Ff09E890A7a8e817f304"
 RITUAL_WALLET="0x532F0dF0896F353d8C3DD8cc134e8129DA2a3948"
+SCHEDULER="0x56e776bae2dd60664b69bd5f865f1180ffb7d58b"
 export REGISTRY="0x9644e8562cE0Fe12b4deeC4163c064A8862Bf47F"
-LOCK_BLOCKS="${LOCK_BLOCKS:-100000}"
+export LOCK_BLOCKS="${LOCK_BLOCKS:-100000}"
 
-need_deposit() { [ -n "${DEPOSIT_WEI:-}" ] || fail "DEPOSIT_WEI is required"; }
+# A sovereign run costs ~0.5-1 RITUAL (varies by model, iterations, tool calls). Require at least
+# 1 RITUAL per deploy so a wake can be funded; below that the job is under-funded and silently
+# dropped. Enforced on deploy only - top-ups are additive, so any amount is fine.
+MIN_DEPOSIT_WEI=1000000000000000000   # 1 RITUAL
+need_deposit() { [ -n "${DEPOSIT:-}" ] || fail "DEPOSIT is required (in RITUAL, e.g. DEPOSIT=1)"; }
+require_min_deposit() {
+  awk -v d="$DEPOSIT_WEI" -v m="$MIN_DEPOSIT_WEI" 'BEGIN{exit !(d+0 >= m+0)}' \
+    || fail "DEPOSIT=$DEPOSIT RITUAL is below the 1 RITUAL minimum. A run costs ~0.5-1 RITUAL; fund at least 1 (5 recommended)."
+}
 num() { printf '%s' "${1%% *}"; }  # strip cast's trailing "[1.5e16]" label
+
+# wei -> RITUAL string, truncated to 6 decimals. String-only (no printf %f), so it stays correct
+# regardless of the locale's decimal separator; cast always emits a '.'-separated value.
+fmt_rit() {
+  local v int frac
+  v="$(cast to-unit "${1:-0}" ether)"
+  int="${v%%.*}"; frac="${v#*.}"
+  [ "$int" = "$v" ] && frac=""
+  frac="${frac}000000"
+  printf '%s.%s' "$int" "${frac:0:6}"
+}
 
 # Run a read-only cast call, retrying on an empty result (the public RPC can be flaky). Always
 # exits 0 with the value or "", so callers never abort under set -e on a transient error.
@@ -134,6 +171,20 @@ rpc_read() {
 is_addr() { [[ "$1" =~ ^0x[0-9a-fA-F]{40}$ ]]; }
 predict_harness() { rpc_read cast call "$FACTORY" "predictHarness(address,bytes32)(address,bytes32)" "$WALLET_ADDRESS" "$1" --rpc-url "$RPC_URL" | head -1; }
 deployed() { local c; c="$(rpc_read cast code "$HARNESS" --rpc-url "$RPC_URL")"; [ "${#c}" -gt 2 ]; }
+
+# Alive = the Scheduler still holds a scheduled wake for this agent. The Scheduler's calls(callId)
+# reverts once a call is gone, so a non-empty read on the agent's current or next callId means it is
+# still armed. A dead agent has no callId left and cannot be revived, so a deposit would just be stuck.
+agent_alive() {
+  local h="$1" w out getter
+  for getter in 0x618abb34 0x61f32724; do
+    w="$(rpc_read cast call "$h" "$getter" --rpc-url "$RPC_URL")"; w="${w#0x}"
+    { [ -z "$w" ] || [ -z "${w//0/}" ]; } && continue
+    out="$(rpc_read cast call "$SCHEDULER" "0xd183ce14$w" --rpc-url "$RPC_URL")"
+    [ -n "$out" ] && return 0
+  done
+  return 1
+}
 
 ### ---------- keystore signer ----------
 KEYSTORE_DIR="$HOME/.foundry/keystores"
@@ -170,7 +221,7 @@ import_keystore() {
   local name="${KEYSTORE_ACCOUNT:-}" key p1 p2 i
   if [ -z "$name" ]; then
     printf '  %sname for your keystore [ritual-deployer]:%s ' "$ACCENT" "$RESET" >&2
-    IFS= read -r name < /dev/tty || name=""; [ -z "$name" ] && name="ritual-deployer"
+    IFS= read -r name < /dev/tty || name=""; name="${name%$'\r'}"; [ -z "$name" ] && name="ritual-deployer"
   fi
   if [ -f "$KEYSTORE_DIR/$name" ]; then          # name already exists -> adopt it, don't re-import
     KEYSTORE_ACCOUNT="$name"; set_env_var KEYSTORE_ACCOUNT "$name"
@@ -232,7 +283,7 @@ next_salt() {
   else printf '%s-2' "$s"; fi
 }
 
-# Fixed gas for configure/restart. Ritual's estimateGas lies here (~192M for a call that really
+# Fixed gas for configureFundAndStart. Ritual's estimateGas lies here (~192M for a call that really
 # uses ~2.1M), so we ignore it - a real deploy went through on 3.5M. 5M leaves room and stays
 # well under the 200M block limit. The cast call below still catches a genuinely bad request.
 SCHED_GAS=5000000
@@ -282,7 +333,10 @@ install_foundry() {
 install_uv() {
   step "Installing uv"
   ensure_curl
-  spin 3 "fetch + install uv" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+  # Pin UV_INSTALL_DIR so uv lands exactly where ensure_path_now / persist_path add it to PATH. The
+  # installer defaults there too, but pinning makes the two halves provably agree. $HOME is expanded
+  # by the inner bash at run time (kept literal through the single quotes), so it is always set.
+  spin 3 "fetch + install uv" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" sh'
   ensure_path_now
   persist_path "$HOME/.local/bin"
 }
@@ -301,12 +355,19 @@ ensure_tools() {
 ensure_tools
 resolve_signer
 
+# DEPOSIT is given in whole RITUAL (DEPOSIT=1 -> 1 RITUAL, decimals like 0.5 ok). Convert to wei once
+# cast is on PATH; everything downstream (min-check, deploy, value flags) works in wei.
+if [ -n "${DEPOSIT:-}" ]; then
+  DEPOSIT_WEI="$(cast to-wei "$DEPOSIT" ether 2>/dev/null)" \
+    || fail "DEPOSIT=$DEPOSIT is not a valid RITUAL amount (use a number like 1 or 0.5)"
+fi
+
 # deterministic harness address (also the delivery target) - needed by every command
 USERSALT="$(cast keccak "${SALT:-ritual-agent-1}")"
 HARNESS="$(predict_harness "$USERSALT")"
 export HARNESS
 
-# Live = a contract is deployed at this harness AND it has already been configured (armed/stopped).
+# Live = a contract is deployed at this harness AND it has already been configured.
 is_live() {
   local h="$1" c
   c="$(rpc_read cast code "$h" --rpc-url "$RPC_URL")"
@@ -314,133 +375,232 @@ is_live() {
   [ "$(rpc_read cast call "$h" 'configured()(bool)' --rpc-url "$RPC_URL")" = "true" ]
 }
 
-# Print one agent row: salt, address, state, balance.
-print_agent() {
-  local salt="$1" h="$2" cf wake bal state
-  cf="$(rpc_read cast call "$h" 'configured()(bool)' --rpc-url "$RPC_URL")"
-  wake="$(num "$(rpc_read cast call "$h" 'wakeMode()(uint8)' --rpc-url "$RPC_URL")")"
-  bal="$(num "$(rpc_read cast call "$RITUAL_WALLET" 'balanceOf(address)(uint256)' "$h" --rpc-url "$RPC_URL")")"
-  bal="$(cast to-unit "${bal:-0}" ether)"
-  if [ "$cf" != "true" ]; then state="${WARNC}unconfigured${RESET}"
-  elif [ "$wake" = "1" ]; then state="${OKC}armed${RESET}"
-  else state="${MUTED}stopped${RESET}"; fi
-  printf '  %s%-18s%s %s  %b  %s RITUAL\n' "$BOLD" "$salt" "$RESET" "$h" "$state" "$bal"
-}
-
-# Detailed view of a single agent by address (used when an address is passed to status).
-print_agent_detail() {
-  local h="$1" c bal lock
-  c="$(rpc_read cast code "$h" --rpc-url "$RPC_URL")"
-  [ "${#c}" -gt 2 ] || { warn "no contract at $h (not deployed)"; return; }
-  bal="$(num "$(rpc_read cast call "$RITUAL_WALLET" 'balanceOf(address)(uint256)' "$h" --rpc-url "$RPC_URL")")"
-  lock="$(num "$(rpc_read cast call "$RITUAL_WALLET" 'lockUntil(address)(uint256)' "$h" --rpc-url "$RPC_URL")")"
-  hr
-  kv "agent" "$h"
-  kv "configured" "$(rpc_read cast call "$h" 'configured()(bool)' --rpc-url "$RPC_URL")"
-  kv "wakeMode" "$(num "$(rpc_read cast call "$h" 'wakeMode()(uint8)' --rpc-url "$RPC_URL")")  (1 armed / 0 stopped)"
-  kv "balance" "$(cast to-unit "${bal:-0}" ether) RITUAL"
-  kv "lockUntil" "block ${lock:-?}  (now $(rpc_read cast block-number --rpc-url "$RPC_URL"))"
-}
-
-# status            -> list every agent you deployed (salt series agent-1, agent-2, ...).
-# status <address>  -> detailed view of one agent (paste any harness address).
-cmd_status() {
-  local arg="${1:-}"
+# view [eoa] -> show every sovereign agent an EOA deployed (from the chain indexer, not by guessing
+# salts): each LIVE or DEAD with the RITUAL stuck in its wallet, in a table. No address -> your wallet.
+cmd_view() {
+  local eoa="${1:-$WALLET_ADDRESS}"
+  is_addr "$eoa" || fail "not a valid EOA address: $eoa"
   banner
-  kv "Owner" "$WALLET_ADDRESS"
+  kv "Owner" "$eoa"
   kv "Chain" "$(cast chain-id --rpc-url "$RPC_URL")"
-  if is_addr "$arg"; then step "Agent"; print_agent_detail "$arg"; return; fi
+  scan_agents "$eoa"
+  if [ "${SCAN_LIVE:-0}" -gt 0 ]; then
+    info "add funds to a live agent: bash run.sh topup <agent-address> [amount]  (in RITUAL)"
+  elif [ "${SCAN_DEAD:-0}" -gt 0 ]; then
+    info "dead agents cannot be revived and their balance is stuck; start fresh with: bash run.sh deploy"
+  fi
+}
+
+# Run the embedded indexer scanner for an EOA and print the LIVE/DEAD + stuck-RITUAL table. Sets
+# SCAN_COUNT / SCAN_LIVE / SCAN_DEAD / SCAN_TOTAL / SCAN_N for the caller. Stdlib-only Python under uv.
+scan_agents() {
+  local eoa="$1"
+  step "Scanning agents"
+  info "reading the indexer + chain - can take ~10-30s for busy wallets"
+
+  local PYTMP; PYTMP="$(mktemp)"
+  cat >"$PYTMP" <<'PY'
+import json, os, sys, urllib.request, urllib.error, datetime
+RPC     = os.environ.get("RPC_URL", "https://rpc.ritualfoundation.org")
+INDEXER = "https://explorer.ritualfoundation.org/api/indexer-proxy/api/v1"
+FACTORY = "0x9dc4c054e53bcc4ce0a0ff09e890a7a8e817f304"
+WALLET  = "0x532f0df0896f353d8c3dd8cc134e8129da2a3948"
+SCHED   = "0x56e776bae2dd60664b69bd5f865f1180ffb7d58b"
+SEL = {"wakeMode":"0x60db537d","configured":"0x8772a23a","currentSeriesId":"0xc9777451",
+       "curCallId":"0x618abb34","nextCallId":"0x61f32724","balanceOf":"0x70a08231",
+       "lockUntil":"0xeba74ee9","calls":"0xd183ce14","predictHarness":"0x78165f40"}
+DEPLOY_SEL, CONFIG_SEL = "0x3293993b", "0xb1906702"
+UA = "Mozilla/5.0 (RitualAgentExplorer)"
+def _post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"content-type":"application/json","user-agent":UA})
+    with urllib.request.urlopen(req, timeout=40) as r: return json.loads(r.read())
+def _get(url):
+    req = urllib.request.Request(url, headers={"accept":"application/json","user-agent":UA})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r: return json.loads(r.read()), 200
+    except urllib.error.HTTPError as e:
+        try: return json.loads(e.read()), e.code
+        except Exception: return None, e.code
+    except Exception: return None, 0
+def rpc(method, params):
+    try: return _post(RPC, {"jsonrpc":"2.0","method":method,"params":params,"id":1}).get("result")
+    except Exception: return None
+def rpc_batch(reqs):
+    body = [{"jsonrpc":"2.0","method":m,"params":p,"id":i} for i,(m,p) in enumerate(reqs)]
+    out = [None]*len(reqs)
+    try:
+        for item in _post(RPC, body):
+            if isinstance(item, dict) and "id" in item: out[item["id"]] = item.get("result")
+    except Exception:
+        for i,(m,p) in enumerate(reqs): out[i] = rpc(m,p)
+    return out
+def eth_call(to, data): return rpc("eth_call", [{"to":to,"data":data}, "latest"])
+def pad(a): return a.lower().replace("0x","").rjust(64,"0")
+def hint(h):
+    if not h or h == "0x": return 0
+    try: return int(h, 16)
+    except Exception: return 0
+def word_addr(res):
+    if not res or len(res) < 66: return None
+    return "0x" + res[2:][24:64]
+def predict_harness(owner, salt32):
+    return word_addr(eth_call(FACTORY, SEL["predictHarness"]+pad(owner)+salt32.replace("0x","").rjust(64,"0")))
+def indexer_txs(eoa):
+    eoa = eoa.lower(); txs = {}
+    d, code = _get(f"{INDEXER}/addresses/{eoa}/transactions?limit=100")
+    if code == 200 and d and "transactions" in d:
+        for t in d["transactions"]: txs[t["tx_hash"]] = t
+        off = 100
+        while d.get("hasMore") and off < 1000:
+            d, code = _get(f"{INDEXER}/addresses/{eoa}/transactions?limit=100&offset={off}")
+            if not d or "transactions" not in d: break
+            for t in d["transactions"]: txs[t["tx_hash"]] = t
+            off += 100
+        return list(txs.values())
+    cur = datetime.date.today()
+    for _ in range(24):
+        start = cur.replace(day=1); fd, td = start.isoformat(), cur.isoformat(); off = 0
+        while True:
+            d, code = _get(f"{INDEXER}/addresses/{eoa}/transactions?limit=50&offset={off}&from_date={fd}&to_date={td}")
+            if not d or "transactions" not in d: break
+            for t in d["transactions"]: txs[t["tx_hash"]] = t
+            if not d.get("hasMore"): break
+            off += 50
+        cur = start - datetime.timedelta(days=1)
+    return list(txs.values())
+def find_agents(txs, eoa):
+    eoa = eoa.lower(); agents = {}
+    for t in txs:
+        if (t.get("from_address") or "").lower() != eoa: continue
+        sel = (t.get("method_selector") or "")[:10]
+        if sel == CONFIG_SEL:
+            a = (t.get("to_address") or "").lower()
+            if a: agents.setdefault(a, {}); agents[a]["configured"]=True
+        elif sel == DEPLOY_SEL:
+            inp = t.get("input_data")
+            if not inp:
+                td, _ = _get(f"{INDEXER}/transactions/{t['tx_hash']}"); inp = (td or {}).get("input_data")
+            if inp and len(inp) >= 74:
+                a = predict_harness(eoa, "0x"+inp[10:74])
+                if a: a=a.lower(); agents.setdefault(a, {}); agents[a]["salt"]="0x"+inp[10:74]
+    return agents
+def agent_status(addr, block):
+    addr = addr.lower()
+    r = rpc_batch([
+        ("eth_call",[{"to":addr,"data":SEL["wakeMode"]},"latest"]),
+        ("eth_call",[{"to":addr,"data":SEL["configured"]},"latest"]),
+        ("eth_call",[{"to":addr,"data":SEL["currentSeriesId"]},"latest"]),
+        ("eth_call",[{"to":addr,"data":SEL["curCallId"]},"latest"]),
+        ("eth_call",[{"to":addr,"data":SEL["nextCallId"]},"latest"]),
+        ("eth_call",[{"to":WALLET,"data":SEL["balanceOf"]+pad(addr)},"latest"]),
+        ("eth_call",[{"to":WALLET,"data":SEL["lockUntil"]+pad(addr)},"latest"]),
+    ])
+    c1, c4 = hint(r[3]), hint(r[4]); scheduled=False
+    for cid in (c1, c4):
+        if cid and eth_call(SCHED, SEL["calls"]+hex(cid)[2:].rjust(64,"0")) is not None:
+            scheduled=True; break
+    lock = hint(r[6])
+    return {"wakeMode":hint(r[0]),"configured":hint(r[1])==1,"series":hint(r[2]),
+            "balance_wei":hint(r[5]),"lockUntil":lock,"lockExpired":(block>=lock if lock else True),
+            "live":scheduled}
+def main():
+    eoa = (sys.argv[1] if len(sys.argv)>1 else os.environ.get("WALLET_ADDRESS","")).strip()
+    block = hint(rpc("eth_blockNumber", []))
+    txs = indexer_txs(eoa); amap = find_agents(txs, eoa); rows = []
+    for a, meta in amap.items():
+        try:
+            st = agent_status(a, block); st.update(meta); st["address"]=a; rows.append(st)
+        except Exception as e:
+            rows.append({"address":a,"error":str(e),"balance_wei":0})
+    rows.sort(key=lambda x: x.get("series",0), reverse=True)
+    live = sum(1 for x in rows if x.get("live")); total = sum(int(x.get("balance_wei",0)) for x in rows)
+    print(f"BLOCK={block}")
+    for x in rows:
+        print("AGENT\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s" % (
+            x["address"], 1 if x.get("live") else 0, 1 if x.get("configured") else 0,
+            x.get("wakeMode",0), x.get("series",0), int(x.get("balance_wei",0)),
+            x.get("lockUntil",0), 1 if x.get("lockExpired") else 0, x.get("salt","") or ""))
+    print("SUMMARY\t%d\t%d\t%d\t%d" % (len(rows), live, len(rows)-live, total))
+if __name__ == "__main__":
+    main()
+PY
+  # `python` (not python3): uv's managed interpreter exposes `python` on every platform, incl. the
+  # Windows uv env used under Git Bash, where a bare `python3` falls through to the MS Store stub.
+  spin 3 "discover agents, check live/dead, read balances" \
+    uv run --quiet --python 3.12 python "$PYTMP" "$eoa"
+  rm -f "$PYTMP"
+
+  SCAN_COUNT=0; SCAN_LIVE=0; SCAN_DEAD=0; SCAN_TOTAL=0; SCAN_N=0
+  local sline
+  sline="$(grep -E '^SUMMARY' "$LOGFILE" | tail -1)"
+  if [ -n "$sline" ]; then IFS=$'\t' read -r _ SCAN_COUNT SCAN_LIVE SCAN_DEAD SCAN_TOTAL <<< "$sline"; fi
+
   step "Your agents"
-  local salt="${SALT:-ritual-agent-1}" miss=0 found=0 us h code
-  while [ "$miss" -lt 2 ] && [ "$found" -lt 100 ]; do
-    us="$(cast keccak "$salt")"
-    h="$(predict_harness "$us")"
-    code="$(rpc_read cast code "$h" --rpc-url "$RPC_URL")"
-    if [ "${#code}" -le 2 ]; then miss=$((miss + 1)); salt="$(next_salt "$salt")"; continue; fi
-    miss=0; found=$((found + 1))
-    print_agent "$salt" "$h"
-    salt="$(next_salt "$salt")"
-  done
-  if [ "$found" -eq 0 ]; then info "no agents yet - run: bash run.sh deploy"
-  else hr; info "$found agent(s). Manage one: bash run.sh restart|stop|topup <agent-address>"; fi
-}
+  while IFS=$'\t' read -r _ addr islive cfg wake series bal lock lockexp salt; do
+    [ -z "$addr" ] && continue
+    if [ "$SCAN_N" -eq 0 ]; then                     # header row, printed once above the first agent
+      printf '  %s%-42s  %-4s  %12s  %6s  %-12s  %s%s\n' \
+        "$MUTED" "AGENT" "STATE" "RITUAL" "SERIES" "CONFIG" "LOCK" "$RESET"
+    fi
+    SCAN_N=$((SCAN_N + 1))
+    local statec statew lockstr cfgstr
+    if [ "$islive" = 1 ]; then statec="$OKC"; statew="live"; else statec="$BADC"; statew="dead"; fi
+    if [ "$lockexp" = 1 ]; then lockstr="unlocked"; else lockstr="locked @ $lock"; fi
+    if [ "$cfg" = 1 ]; then cfgstr="configured"; else cfgstr="unconfigured"; fi
+    printf '  %s%-42s%s  %s%-4s%s  %12s  %6s  %-12s  %s\n' \
+      "$BOLD" "$addr" "$RESET" "$statec" "$statew" "$RESET" "$(fmt_rit "$bal")" "$series" "$cfgstr" "$lockstr"
+  done < <(grep -E '^AGENT' "$LOGFILE")
 
-# Read wakeMode and report it with the correct label (1+ = armed, 0 = stopped).
-report_wake() {
-  local wm; wm="$(num "$(rpc_read cast call "$HARNESS" 'wakeMode()(uint8)' --rpc-url "$RPC_URL")")"
-  { [ "$wm" = "0" ] && ok "wakeMode 0 (stopped)"; } || ok "wakeMode ${wm:-?} (armed)"
-}
-
-cmd_restart() {
-  if is_addr "${1:-}"; then HARNESS="$1"; fi
-  deployed || fail "harness not deployed yet - run: bash run.sh deploy"
-  banner
-  step "Re-arm agent"
-  kv "agent" "$HARNESS"
-  cast call "$HARNESS" "restart()" --from "$WALLET_ADDRESS" --rpc-url "$RPC_URL" >/dev/null 2>&1 \
-    || fail "restart() reverts on-chain - the agent is already armed, or its schedule has ended"
-  unlock
-  spin "broadcasting restart()" \
-    cast send "$HARNESS" "restart()" --account "$KEYSTORE_ACCOUNT" --password "$KS_PASSWORD" --rpc-url "$RPC_URL" --gas-limit "$SCHED_GAS"
-  report_wake
-}
-
-cmd_stop() {
-  if is_addr "${1:-}"; then HARNESS="$1"; fi
-  deployed || fail "harness not deployed"
-  banner
-  step "Stop agent"
-  kv "agent" "$HARNESS"
-  cast call "$HARNESS" "stop()" --from "$WALLET_ADDRESS" --rpc-url "$RPC_URL" >/dev/null 2>&1 \
-    || fail "stop() reverts on-chain - the agent is not in a stoppable state (its schedule may have already ended)"
-  unlock
-  spin "broadcasting stop()" \
-    cast send "$HARNESS" "stop()" --account "$KEYSTORE_ACCOUNT" --password "$KS_PASSWORD" --rpc-url "$RPC_URL" --gas-limit 3500000
-  report_wake
+  if [ "$SCAN_N" -eq 0 ]; then
+    info "no sovereign agents found for this EOA"
+  else
+    hr
+    kv "Agents" "$SCAN_COUNT  (${OKC}${SCAN_LIVE} live${RESET} / ${BADC}${SCAN_DEAD} dead${RESET})"
+    kv "Stuck RITUAL" "$(fmt_rit "${SCAN_TOTAL:-0}") across all agents"
+  fi
 }
 
 cmd_topup() {
-  need_deposit
-  local amount
-  if is_addr "${1:-}"; then HARNESS="$1"; amount="${2:-$DEPOSIT_WEI}"; else amount="${1:-$DEPOSIT_WEI}"; fi
+  local ritual amount
+  if is_addr "${1:-}"; then HARNESS="$1"; ritual="${2:-${DEPOSIT:-}}"; else ritual="${1:-${DEPOSIT:-}}"; fi
+  [ -n "$ritual" ] || fail "amount required: bash run.sh topup <address> <amount>  (in RITUAL, or set DEPOSIT in .env)"
+  amount="$(cast to-wei "$ritual" ether 2>/dev/null)" || fail "amount '$ritual' is not a valid RITUAL number"
   deployed || fail "harness not deployed yet - run: bash run.sh deploy"
+  agent_alive "$HARNESS" || fail "agent $HARNESS is dead - it has no scheduled wake left, so a deposit cannot revive it and would be stuck. Deploy a fresh agent: bash run.sh deploy"
   banner
-  step "Deposit $(cast to-unit "$amount" ether) RITUAL"
+  step "Deposit $ritual RITUAL"
   kv "agent" "$HARNESS"
   info "lock $LOCK_BLOCKS blocks"
   unlock
   spin "depositing" \
     cast send "$RITUAL_WALLET" "depositFor(address,uint256)" "$HARNESS" "$LOCK_BLOCKS" --account "$KEYSTORE_ACCOUNT" --password "$KS_PASSWORD" --rpc-url "$RPC_URL" --value "$amount"
-  if [ "$(num "$(rpc_read cast call "$HARNESS" 'wakeMode()(uint8)' --rpc-url "$RPC_URL")")" = "0" ]; then
-    warn "agent was stopped; re-arming"
-    cmd_restart
-  else
-    ok "topped up. balance $(cast to-unit "$(num "$(rpc_read cast call "$RITUAL_WALLET" 'balanceOf(address)(uint256)' "$HARNESS" --rpc-url "$RPC_URL")")" ether) RITUAL (still armed)"
-  fi
+  ok "topped up. balance $(cast to-unit "$(num "$(rpc_read cast call "$RITUAL_WALLET" 'balanceOf(address)(uint256)' "$HARNESS" --rpc-url "$RPC_URL")")" ether) RITUAL"
+  info "this deposit funds the agent's upcoming wakes"
 }
 
 cmd_deploy() {
   need_deposit
+  require_min_deposit
   banner
   kv "Owner" "$WALLET_ADDRESS"
   kv "Chain" "$(cast chain-id --rpc-url "$RPC_URL")"
   kv "Balance" "$(cast balance "$WALLET_ADDRESS" --ether --rpc-url "$RPC_URL") RITUAL"
 
-  # Resolve the agent for the configured SALT. If it is already live, ask before making another;
-  # on yes, advance to the first free salt (agent-1 -> agent-2 -> ...).
+  # Resolve the agent address for SALT. If that slot already has a live agent, show the wallet's full
+  # fleet from the indexer (the same table as `view`), then ask before bumping to the next free salt
+  # (my-agent-1 -> my-agent-2 -> ...) and deploying there.
   step "Select agent"
   local salt="${SALT:-ritual-agent-1}" reply n=0
   USERSALT="$(cast keccak "$salt")"
   HARNESS="$(predict_harness "$USERSALT")"
   if is_live "$HARNESS"; then
-    warn "you already have an agent live:"
-    kv "  salt" "$salt"
-    kv "  agent" "$HARNESS"
+    scan_agents "$WALLET_ADDRESS"
     printf '\n  %sDeploy another (new) agent? [y/N]%s ' "$ACCENT" "$RESET"
-    read -r reply < /dev/tty 2>/dev/null || reply=""
+    read -r reply < /dev/tty 2>/dev/null || reply=""; reply="${reply%$'\r'}"
     case "$reply" in
       y|Y|yes|YES) ;;
-      *) printf '\n'; info "left it running - inspect with: bash run.sh status"; exit 0 ;;
+      *) printf '\n'; info "left it running - inspect with: bash run.sh view"; exit 0 ;;
     esac
     while is_live "$HARNESS"; do
       salt="$(next_salt "$salt")"
@@ -452,7 +612,7 @@ cmd_deploy() {
   fi
   export HARNESS
   kv "Salt" "$salt"
-  kv "Deposit" "$(cast to-unit "$DEPOSIT_WEI" ether) RITUAL"
+  kv "Deposit" "$DEPOSIT RITUAL"
   kv "Harness" "$HARNESS"
   unlock
 
@@ -488,15 +648,19 @@ pub = bytes(node[3])
 harness = Web3.to_checksum_address(os.environ["HARNESS"])
 enc = ecies_encrypt(pub.hex(), b'{"LLM_PROVIDER":"ritual"}')
 delivery_selector = Web3.keccak(text="onSovereignAgentResult(bytes32,bytes)")[:4]
-max_poll_block = w3.eth.block_number + 10_000_000
+# maxPollBlock is a Phase-2 deadline OFFSET (relative to settlement), not an absolute block.
+# The chain rejects the agent's async job unless ttl < maxPollBlock <= 70000; 6000 ~= 35 min.
+max_poll_block = 6000
 
 params = (
     executor, 500, b"", 5, max_poll_block, "SOVEREIGN_AGENT_TASK", harness, delivery_selector,
     3_000_000, 1_000_000_000, 100_000_000, int(os.environ["CLI_TYPE"]), os.environ["PROMPT"], enc,
-    ("", "", ""), ("", "", ""), [], ("", "", ""), os.environ["MODEL"], [], 5, 2048, "",
+    ("", "", ""), ("", "", ""), [], ("", "", ""), os.environ["MODEL"], [], 50, 8192, "",
 )
-schedule = (800_000, 180, 500, 1_000_000_000, 100_000_000, 0)
-rolling = (1, 5000, 1)
+# frequency 2000 blocks (~11.7 min) clears the 60-90s agent round-trip so a new wake does not
+# hit the per-sender async lock; windowNumCalls 5 keeps 5*2000 within MAX_LIFESPAN (10000).
+schedule = (800_000, 2000, 500, 1_000_000_000, 100_000_000, 0)
+rolling = (5, 5000, 1)
 
 PT = ("(address,uint256,bytes,uint64,uint64,string,address,bytes4,uint256,uint256,uint256,uint16,"
       "string,bytes,(string,string,string),(string,string,string),(string,string,string)[],"
@@ -504,12 +668,15 @@ PT = ("(address,uint256,bytes,uint64,uint64,string,address,bytes4,uint256,uint25
 ST = "(uint32,uint32,uint32,uint256,uint256,uint256)"
 RT = "(uint32,uint16,uint16)"
 selector = Web3.keccak(text=f"configureFundAndStart({PT},{ST},{RT},uint256)")[:4]
-data = selector + encode([PT, ST, RT, "uint256"], [params, schedule, rolling, 100_000])
+data = selector + encode([PT, ST, RT, "uint256"], [params, schedule, rolling, int(os.environ["LOCK_BLOCKS"])])
 print("EXECUTOR=" + executor)
 print("CONFIG_CALLDATA=0x" + data.hex())
 PY
+  # Pin Python 3.12 + eciespy 0.4: coincurve (eciespy's secp256k1 dep) ships wheels only to cp313 so
+  # 3.14+ builds from source and fails, and eciespy's config/encrypt API changed at 0.3 -> 0.4. Use
+  # `python` not `python3` so it also works in uv's Windows env under Git Bash. uv fetches 3.12 itself.
   spin 3 "discover executor, encrypt secret, encode calldata" \
-    uv run --quiet --with eciespy --with eth-abi --with web3 python3 "$PYTMP"
+    uv run --quiet --python 3.12 --with 'eciespy>=0.4,<0.5' --with eth-abi --with web3 python "$PYTMP"
   rm -f "$PYTMP"
   local OUT EXECUTOR CONFIG_CALLDATA
   OUT="$(cat "$LOGFILE")"
@@ -554,9 +721,7 @@ PY
 
 case "$CMD" in
   deploy)         cmd_deploy ;;
-  status|view)    cmd_status "${1:-}" ;;
+  view|status)    cmd_view "${1:-}" ;;
   topup|fund)     cmd_topup "${1:-}" "${2:-}" ;;
-  restart|revive) cmd_restart "${1:-}" ;;
-  stop)           cmd_stop "${1:-}" ;;
   *)              usage; fail "unknown command: $CMD" ;;
 esac
